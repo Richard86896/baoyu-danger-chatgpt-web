@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+generated.png
+generated.jpg
+generated.jpeg
+generated.webp

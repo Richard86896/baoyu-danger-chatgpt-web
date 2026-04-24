@@ -1,0 +1,13 @@
+{
+  "name": "baoyu-danger-chatgpt-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "node scripts/main.js --login",
+    "check": "node scripts/main.js --check"
+  },
+  "dependencies": {
+    "playwright": "^1.58.0"
+  }
+}
