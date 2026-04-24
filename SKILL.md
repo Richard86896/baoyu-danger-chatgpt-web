@@ -48,7 +48,9 @@ Consent file format:
 
 ## Auth Model
 
-This skill uses a persistent Chrome profile plus Playwright storage state:
+This skill now prefers **manual Chrome attach mode**:
+- you manually open a dedicated Chrome with a debug port
+- the script attaches to that browser session
 - one-time browser login with `--login`
 - session reused from local profile/state files
 - no API key needed
@@ -56,6 +58,9 @@ This skill uses a persistent Chrome profile plus Playwright storage state:
 Default session files:
 - profile dir: `~/Library/Application Support/baoyu-skills/chatgpt-web/chrome-profile`
 - storage state: `~/Library/Application Support/baoyu-skills/chatgpt-web/storage-state.json`
+
+Default debug port:
+- `9222`
 
 ## Setup
 
@@ -66,22 +71,37 @@ cd ~/.agents/skills/baoyu-danger-chatgpt-web
 npm install
 ```
 
+Then open a dedicated Chrome manually:
+
+```bash
+open -na "Google Chrome" --args \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir="$HOME/Library/Application Support/baoyu-skills/chatgpt-web/chrome-profile" \
+  --new-window https://chatgpt.com/
+```
+
 Then log in once:
 
 ```bash
 node scripts/main.js --login --accept-risk
 ```
 
-The script opens real Chrome. Complete ChatGPT login and any Cloudflare checks in the browser window.
+Complete ChatGPT login and any Cloudflare checks in that Chrome window.
+
+`--launch` still exists, but it is now the fallback path rather than the default.
 
 ## Usage
 
 ```bash
-# One-time login
+# One-time login after manually opening the dedicated Chrome
 node scripts/main.js --login --accept-risk
 
 # Verify saved session
 node scripts/main.js --check
+
+# Optional: let the script launch Chrome itself
+node scripts/main.js --launch --login --accept-risk
 
 # Generate one image
 node scripts/main.js --prompt "A cinematic bookstore interior, warm tungsten light" --image out.png
@@ -100,8 +120,9 @@ node scripts/main.js --prompt "A clean SaaS hero illustration" --image hero.png 
 
 | Option | Description |
 | --- | --- |
-| `--login` | Open Chrome and wait for a valid ChatGPT session |
+| `--login` | Wait for a valid ChatGPT session on the attached Chrome |
 | `--check` | Verify whether the saved ChatGPT session is usable |
+| `--launch` | Launch a dedicated Chrome instead of attaching to an existing one |
 | `--accept-risk` | Accept the danger disclaimer and save consent |
 | `--show-disclaimer` | Print the disclaimer and exit |
 | `--prompt`, `-p` | Prompt text |
@@ -109,6 +130,8 @@ node scripts/main.js --prompt "A clean SaaS hero illustration" --image hero.png 
 | `--image [path]` | Output image path, default `generated.png` |
 | `--n <count>` | Number of images to capture from the page, default `1` |
 | `--timeout <ms>` | Overall wait timeout, default `300000` |
+| `--debug-port <port>` | Chrome DevTools port, default `9222` |
+| `--cdp-url <ws-url>` | Full Chrome DevTools WebSocket URL |
 | `--profile-dir <path>` | Custom Chrome profile directory |
 | `--storage-state <path>` | Custom storage state path |
 | `--keep-open` | Leave Chrome open after the run |
@@ -119,6 +142,7 @@ node scripts/main.js --prompt "A clean SaaS hero illustration" --image hero.png 
 ## Behavior Notes
 
 - This skill uses the website, not `/v1/images/*`
+- Default mode no longer kills or launches Chrome automatically; it attaches to a browser you already opened
 - It is best-effort and may need selector updates later
 - Image capture currently targets visible large images rendered in the assistant response
 - The script captures the rendered image elements from the page; it does not promise original CDN asset extraction
@@ -133,3 +157,6 @@ node scripts/main.js --prompt "A clean SaaS hero illustration" --image hero.png 
 | `CHATGPT_WEB_BASE_URL` | Override site URL, default `https://chatgpt.com/` |
 | `CHATGPT_WEB_CHROME_CHANNEL` | Browser channel, default `chrome` |
 | `CHATGPT_WEB_TIMEOUT_MS` | Default timeout override |
+| `CHATGPT_WEB_DEBUG_PORT` | Default debug port, default `9222` |
+| `CHATGPT_WEB_CDP_URL` | Explicit Chrome DevTools WebSocket URL |
+| `CHATGPT_WEB_CHROME_PATH` | Chrome binary override for `--launch` mode |

@@ -19,13 +19,17 @@ const CHROME_CANDIDATES = [
 
 function printUsage() {
   console.log(`Usage:
-  node scripts/main.js --login --accept-risk
+  # Recommended: manually open a dedicated Chrome once, then attach
   node scripts/main.js --check
   node scripts/main.js --prompt "A cinematic bookstore interior" --image out.png
 
+  # Optional: let the script launch a dedicated Chrome itself
+  node scripts/main.js --login --accept-risk
+
 Options:
-  --login                   Open real Chrome and wait for ChatGPT login
+  --login                   Wait for ChatGPT login on the attached Chrome session
   --check                   Verify saved session
+  --launch                  Launch a dedicated Chrome for this skill instead of attaching
   --accept-risk             Save danger-consent file
   --show-disclaimer         Print disclaimer and exit
   -p, --prompt <text>       Prompt text
@@ -33,6 +37,8 @@ Options:
   --image [path]            Output image path (default: generated.png)
   --n <count>               Number of images to capture (default: 1)
   --timeout <ms>            Overall timeout (default: 300000)
+  --debug-port <port>       CDP port for attach/launch mode (default: 9222)
+  --cdp-url <ws-url>        Full Chrome DevTools WebSocket URL
   --profile-dir <path>      Custom Chrome profile directory
   --storage-state <path>    Custom storage state path
   --keep-open               Leave Chrome open after finishing
@@ -46,7 +52,9 @@ Environment:
   CHATGPT_WEB_BASE_URL
   CHATGPT_WEB_CHROME_CHANNEL
   CHATGPT_WEB_TIMEOUT_MS
-  CHATGPT_WEB_CHROME_PATH`);
+  CHATGPT_WEB_CHROME_PATH
+  CHATGPT_WEB_DEBUG_PORT
+  CHATGPT_WEB_CDP_URL`);
 }
 
 function printDisclaimer() {
@@ -62,6 +70,7 @@ function parseArgs(argv) {
   const out = {
     login: false,
     check: false,
+    launch: false,
     acceptRisk: false,
     showDisclaimer: false,
     prompt: null,
@@ -69,6 +78,8 @@ function parseArgs(argv) {
     imagePath: null,
     n: 1,
     timeoutMs: Number.isFinite(DEFAULT_TIMEOUT_MS) ? DEFAULT_TIMEOUT_MS : 300000,
+    debugPort: Number.parseInt(process.env.CHATGPT_WEB_DEBUG_PORT || "9222", 10),
+    cdpUrl: process.env.CHATGPT_WEB_CDP_URL?.trim() || null,
     profileDir: null,
     storageStatePath: null,
     keepOpen: false,
@@ -103,6 +114,10 @@ function parseArgs(argv) {
     }
     if (arg === "--check") {
       out.check = true;
+      continue;
+    }
+    if (arg === "--launch") {
+      out.launch = true;
       continue;
     }
     if (arg === "--accept-risk") {
@@ -162,6 +177,20 @@ function parseArgs(argv) {
       const value = Number.parseInt(argv[++i] || "", 10);
       if (!Number.isInteger(value) || value < 1000) throw new Error("--timeout must be an integer >= 1000");
       out.timeoutMs = value;
+      continue;
+    }
+    if (arg === "--debug-port") {
+      const value = Number.parseInt(argv[++i] || "", 10);
+      if (!Number.isInteger(value) || value < 1 || value > 65535) {
+        throw new Error("--debug-port must be an integer between 1 and 65535");
+      }
+      out.debugPort = value;
+      continue;
+    }
+    if (arg === "--cdp-url") {
+      const value = argv[++i];
+      if (!value) throw new Error("Missing value for --cdp-url");
+      out.cdpUrl = value;
       continue;
     }
     if (arg === "--profile-dir") {
@@ -295,6 +324,11 @@ async function waitForDebugEndpoint(port, timeoutMs) {
   throw new Error(`Timed out waiting for Chrome remote debugging endpoint on port ${port}. Last error: ${lastError}`);
 }
 
+function buildManualChromeLaunchHint(profileDir, port) {
+  const escapedProfile = profileDir.replace(/"/g, '\\"');
+  return `open -na "Google Chrome" --args --remote-debugging-port=${port} --remote-debugging-address=127.0.0.1 --user-data-dir="${escapedProfile}" --new-window https://chatgpt.com/`;
+}
+
 async function resolveChromeBinary() {
   for (const candidate of CHROME_CANDIDATES) {
     if (candidate && await exists(candidate)) return candidate;
@@ -309,21 +343,9 @@ function resolveChromeAppBundle(chromeBinary) {
   return chromeBinary.slice(0, index);
 }
 
-async function killSkillChrome(profileDir) {
-  await new Promise((resolve) => {
-    const killer = spawn("pkill", ["-f", profileDir], {
-      stdio: "ignore",
-    });
-    killer.on("error", () => resolve());
-    killer.on("exit", () => resolve());
-  });
-  await new Promise((resolve) => setTimeout(resolve, 1200));
-}
-
-async function launchChromeWithCdp(profileDir, headless) {
+async function launchChromeWithCdp(profileDir, headless, debugPort) {
   const chromeBinary = await resolveChromeBinary();
-  await killSkillChrome(profileDir);
-  const port = await getFreePort();
+  const port = debugPort || await getFreePort();
   const args = [
     `--remote-debugging-port=${port}`,
     "--remote-debugging-address=127.0.0.1",
@@ -359,23 +381,48 @@ async function launchChromeWithCdp(profileDir, headless) {
     wsUrl = await waitForDebugEndpoint(port, 30000);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to start the skill-owned Chrome session. If a previous skill window is stuck, close it and retry. Original error: ${message}`);
+    throw new Error(`Failed to start the skill-owned Chrome session. Close any existing dedicated skill Chrome windows and retry. Original error: ${message}`);
   }
   return { chrome, port, wsUrl };
+}
+
+async function resolveAttachWebSocketUrl(args) {
+  if (args.cdpUrl) return args.cdpUrl;
+
+  try {
+    return await waitForDebugEndpoint(args.debugPort, 5000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const profileDir = resolveProfileDir(args);
+    throw new Error(
+      `No attachable Chrome debug session was found on port ${args.debugPort}. ` +
+      `Start a dedicated Chrome manually, then retry.\n` +
+      `Suggested command:\n${buildManualChromeLaunchHint(profileDir, args.debugPort)}\n` +
+      `Original error: ${message}`,
+    );
+  }
 }
 
 async function createSession(args) {
   const { chromium } = await loadPlaywright();
   const profileDir = resolveProfileDir(args);
-  await mkdir(profileDir, { recursive: true });
   let browser;
   let chrome = null;
   let port = null;
   try {
-    const launched = await launchChromeWithCdp(profileDir, args.headless);
-    chrome = launched.chrome;
-    port = launched.port;
-    browser = await chromium.connectOverCDP(launched.wsUrl, {
+    let wsUrl;
+    if (args.launch) {
+      await mkdir(profileDir, { recursive: true });
+      const launched = await launchChromeWithCdp(profileDir, args.headless, args.debugPort);
+      chrome = launched.chrome;
+      port = launched.port;
+      wsUrl = launched.wsUrl;
+    } else {
+      wsUrl = await resolveAttachWebSocketUrl(args);
+      port = args.debugPort;
+    }
+
+    browser = await chromium.connectOverCDP(wsUrl, {
       timeout: 30000,
     });
   } catch (error) {
