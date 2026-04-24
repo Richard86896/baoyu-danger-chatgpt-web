@@ -48,6 +48,12 @@ function printUsage() {
   node scripts/main.js --check
   node scripts/main.js --prompt "A cinematic bookstore interior" --image out.png
 
+  # Generate an article image plan from article text, then generate images from that plan
+  node scripts/main.js --article-file article.md --image article.png
+
+  # Only output the article image plan JSON
+  node scripts/main.js --article-file article.md --plan-only --plan-output article-images.json
+
   # Generate multiple different images in the same ChatGPT conversation
   node scripts/main.js --batch-file article-images.json --image article.png
 
@@ -63,6 +69,13 @@ Options:
   --show-disclaimer         Print disclaimer and exit
   -p, --prompt <text>       Prompt text
   --promptfiles <files...>  Read prompt from files (concatenated)
+  --article <text>          Article text to analyze for image planning
+  --article-file <path>     Read article text from one file
+  --articlefiles <files...> Read article text from one or more files (concatenated)
+  --article-title <text>    Optional article title override for article mode
+  --article-max-images <n>  Max images to plan from article mode (default: 6)
+  --plan-only               In article mode, only output/save the plan JSON
+  --plan-output <path>      Where to save the generated article image plan JSON
   --batch-file <path>       JSON array of prompts/jobs; submits them sequentially in one chat
   --image [path]            Output image path (default: generated.png)
   --n <count>               Number of images to capture (default: 1)
@@ -106,6 +119,12 @@ function parseArgs(argv) {
     showDisclaimer: false,
     prompt: null,
     promptFiles: [],
+    article: null,
+    articleFiles: [],
+    articleTitle: null,
+    articleMaxImages: 6,
+    planOnly: false,
+    planOutput: null,
     batchFile: null,
     imagePath: null,
     n: 1,
@@ -189,6 +208,47 @@ function parseArgs(argv) {
       i = next;
       continue;
     }
+    if (arg === "--article") {
+      const value = argv[++i];
+      if (!value) throw new Error("Missing value for --article");
+      out.article = value;
+      continue;
+    }
+    if (arg === "--article-file") {
+      const value = argv[++i];
+      if (!value) throw new Error("Missing value for --article-file");
+      out.articleFiles.push(value);
+      continue;
+    }
+    if (arg === "--articlefiles") {
+      const { values, next } = takeMany(i);
+      if (values.length === 0) throw new Error("Missing files for --articlefiles");
+      out.articleFiles.push(...values);
+      i = next;
+      continue;
+    }
+    if (arg === "--article-title") {
+      const value = argv[++i];
+      if (!value) throw new Error("Missing value for --article-title");
+      out.articleTitle = value;
+      continue;
+    }
+    if (arg === "--article-max-images") {
+      const value = Number.parseInt(argv[++i] || "", 10);
+      if (!Number.isInteger(value) || value < 1) throw new Error("--article-max-images must be a positive integer");
+      out.articleMaxImages = value;
+      continue;
+    }
+    if (arg === "--plan-only") {
+      out.planOnly = true;
+      continue;
+    }
+    if (arg === "--plan-output") {
+      const value = argv[++i];
+      if (!value) throw new Error("Missing value for --plan-output");
+      out.planOutput = value;
+      continue;
+    }
     if (arg === "--batch-file") {
       const value = argv[++i];
       if (!value) throw new Error("Missing value for --batch-file");
@@ -256,11 +316,25 @@ function parseArgs(argv) {
   if (!out.prompt && positional.length > 0) {
     out.prompt = positional.join(" ");
   }
+  const hasArticleMode = Boolean((out.article && out.article.trim()) || out.articleFiles.length > 0);
   if (out.batchFile && (out.prompt || out.promptFiles.length > 0)) {
     throw new Error("Use either --batch-file or --prompt/--promptfiles, not both.");
   }
+  if (hasArticleMode && (out.prompt || out.promptFiles.length > 0 || out.batchFile)) {
+    throw new Error("Use article mode separately from --prompt/--promptfiles/--batch-file.");
+  }
+  if (out.planOnly && !hasArticleMode) {
+    throw new Error("--plan-only requires article mode.");
+  }
+  if (out.planOutput && !hasArticleMode) {
+    throw new Error("--plan-output requires article mode.");
+  }
 
   return out;
+}
+
+function hasArticleInputs(args) {
+  return Boolean((args.article && args.article.trim()) || args.articleFiles?.length > 0);
 }
 
 function getDataDir() {
@@ -283,6 +357,10 @@ function resolveProfileDir(args) {
 
 function resolveStorageStatePath(args) {
   return path.resolve(args.storageStatePath || process.env.CHATGPT_WEB_STORAGE_STATE_PATH || path.join(getDataDir(), "storage-state.json"));
+}
+
+function resolveLastConversationCapturePath() {
+  return path.join(getDataDir(), "last-conversation-capture.json");
 }
 
 async function exists(filePath) {
@@ -766,6 +844,13 @@ async function saveStorageState(session, args) {
   return storageStatePath;
 }
 
+async function saveConversationCapture(events) {
+  const capturePath = resolveLastConversationCapturePath();
+  await mkdir(path.dirname(capturePath), { recursive: true });
+  await writeFile(capturePath, `${JSON.stringify(events, null, 2)}\n`, "utf8");
+  return capturePath;
+}
+
 async function readPrompt(args) {
   const prompt = await readPromptInput(args.prompt, args.promptFiles, process.cwd());
   if (!prompt) throw new Error("Prompt is required. Use --prompt or --promptfiles.");
@@ -780,6 +865,550 @@ async function readPromptInput(promptText, promptFiles = [], baseDir = process.c
     parts.push(content.trim());
   }
   return parts.filter(Boolean).join("\n\n").trim();
+}
+
+async function readArticleText(args) {
+  const articleText = await readPromptInput(args.article, args.articleFiles, process.cwd());
+  if (!articleText) {
+    throw new Error("Article text is required. Use --article, --article-file, or --articlefiles.");
+  }
+  return articleText;
+}
+
+function detectArticleTitle(articleText) {
+  const lines = String(articleText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    if (line.startsWith("#")) {
+      return line.replace(/^#+\s*/, "").trim() || null;
+    }
+  }
+  return lines[0] || null;
+}
+
+function deriveArticleBaseName(args) {
+  if (args.articleFiles?.length > 0) {
+    return path.parse(args.articleFiles[0]).name || "article";
+  }
+  if (args.imagePath) {
+    return path.parse(args.imagePath).name || "article";
+  }
+  return "article";
+}
+
+function resolveArticleOutputDir(args) {
+  if (args.imagePath) return path.dirname(path.resolve(process.cwd(), args.imagePath));
+  if (args.planOutput) return path.dirname(path.resolve(process.cwd(), args.planOutput));
+  if (args.articleFiles?.length > 0) return path.dirname(path.resolve(process.cwd(), args.articleFiles[0]));
+  return process.cwd();
+}
+
+function resolvePlanOutputPath(args) {
+  if (args.planOutput) return path.resolve(process.cwd(), args.planOutput);
+  const baseName = deriveArticleBaseName(args);
+  return path.join(resolveArticleOutputDir(args), `${baseName}-images.json`);
+}
+
+function resolveArticleImageBasePath(args) {
+  if (args.imagePath) return path.resolve(process.cwd(), args.imagePath);
+  const baseName = deriveArticleBaseName(args);
+  return path.join(resolveArticleOutputDir(args), `${baseName}.png`);
+}
+
+function normalizeInlineWhitespace(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function buildArticleSections(articleText) {
+  const lines = String(articleText || "").split(/\r?\n/);
+  const sections = [];
+  let currentTitle = null;
+  let currentLines = [];
+
+  const flush = () => {
+    const text = normalizeInlineWhitespace(currentLines.join(" "));
+    if (!text) {
+      currentLines = [];
+      return;
+    }
+    sections.push({
+      title: currentTitle,
+      text,
+    });
+    currentLines = [];
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) {
+      flush();
+      continue;
+    }
+
+    const headingMatch = line.match(/^#{1,6}\s+(.+)$/);
+    if (headingMatch) {
+      flush();
+      currentTitle = headingMatch[1].trim();
+      continue;
+    }
+
+    currentLines.push(line);
+  }
+
+  flush();
+  if (sections.length > 0) return sections;
+
+  const paragraphs = String(articleText || "")
+    .split(/\n\s*\n/)
+    .map((block) => normalizeInlineWhitespace(block))
+    .filter(Boolean);
+  return paragraphs.map((text) => ({ title: null, text }));
+}
+
+function scoreArticleSection(section, index, total) {
+  const text = section.text || "";
+  const title = section.title || "";
+  let score = Math.min(text.length / 220, 6);
+  if (title) score += 1.2;
+  if (index === 0) score += 0.8;
+  if (index === total - 1) score += 0.6;
+  if (/(总结|结论|最后|最终|因此|所以|未来|建议|风险|门槛|转变|趋势|交付)/.test(`${title} ${text}`)) score += 1.5;
+  return score;
+}
+
+function pickArticleImageCount(articleText, maxImages) {
+  const length = String(articleText || "").length;
+  let count = 2;
+  if (length >= 900) count = 3;
+  if (length >= 1800) count = 4;
+  if (length >= 3000) count = 5;
+  if (length >= 4500) count = 6;
+  return Math.max(1, Math.min(maxImages, count));
+}
+
+function buildCoverPrompt(articleTitle, articleText) {
+  const focus = normalizeInlineWhitespace(articleText).slice(0, 180);
+  return [
+    "Vertical editorial illustration for a long-form article cover.",
+    articleTitle ? `Article title theme: ${articleTitle}.` : "",
+    focus ? `Core idea from the article: ${focus}.` : "",
+    "Modern magazine art direction, cinematic composition, strong focal subject, clean background, no text, no watermark, not a collage.",
+  ].filter(Boolean).join(" ");
+}
+
+function buildSectionPrompt(articleTitle, sectionTitle, sectionText, placement) {
+  const focus = normalizeInlineWhitespace(sectionText).slice(0, 220);
+  return [
+    "Vertical editorial illustration for an article section.",
+    articleTitle ? `Overall article theme: ${articleTitle}.` : "",
+    sectionTitle ? `Section theme: ${sectionTitle}.` : "",
+    `Placement: ${placement}.`,
+    focus ? `Visualize this idea: ${focus}.` : "",
+    "Editorial storytelling, symbolic but concrete details, clear hierarchy, no text, no watermark, suitable for an article insert.",
+  ].filter(Boolean).join(" ");
+}
+
+function buildLocalArticlePlan(args, articleText) {
+  const articleTitle = args.articleTitle || detectArticleTitle(articleText) || "Article";
+  const sections = buildArticleSections(articleText);
+  const desiredCount = pickArticleImageCount(articleText, args.articleMaxImages);
+  const jobs = [
+    {
+      image: "cover.png",
+      placement: "cover",
+      reason: "封面需要先建立整篇文章的主题氛围和核心判断。",
+      prompt: buildCoverPrompt(articleTitle, articleText),
+      n: 1,
+    },
+  ];
+
+  const scoredSections = sections
+    .map((section, index) => ({
+      ...section,
+      index,
+      score: scoreArticleSection(section, index, sections.length),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const remaining = Math.max(0, desiredCount - 1);
+  const selected = scoredSections.slice(0, remaining).sort((a, b) => a.index - b.index);
+
+  for (let index = 0; index < selected.length; index += 1) {
+    const section = selected[index];
+    const isEnding = section.index === sections.length - 1 && selected.length > 1;
+    const placement = isEnding ? "ending" : `section-${index + 1}`;
+    const image = isEnding ? "ending.png" : `section-${index + 1}.png`;
+    const reason = isEnding
+      ? "结尾适合用一张图收束全文情绪和观点。"
+      : "这一段是正文里的重点观点，单独配图能帮助读者建立视觉锚点。";
+    jobs.push({
+      image,
+      placement,
+      reason,
+      prompt: buildSectionPrompt(articleTitle, section.title, section.text, placement),
+      n: 1,
+    });
+  }
+
+  return {
+    articleTitle,
+    jobs,
+    planningMode: "local",
+  };
+}
+
+function normalizeArticlePlanJson(rawJson) {
+  let text = String(rawJson || "").trim();
+  if (text.startsWith("```")) {
+    text = text.replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+  return text;
+}
+
+function extractMarkedJson(text, beginMarker, endMarker) {
+  const fullText = String(text || "");
+  const endIndex = fullText.lastIndexOf(endMarker);
+  if (endIndex === -1) return null;
+  const beginIndex = fullText.lastIndexOf(beginMarker, endIndex);
+  if (beginIndex === -1) return null;
+  return normalizeArticlePlanJson(fullText.slice(beginIndex + beginMarker.length, endIndex));
+}
+
+function extractLastFencedJson(text) {
+  const matches = Array.from(String(text || "").matchAll(/```(?:json)?\s*([\s\S]*?)```/gi));
+  if (matches.length === 0) return null;
+  return normalizeArticlePlanJson(matches[matches.length - 1][1] || "");
+}
+
+function findBalancedJsonArray(text, startIndex) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = startIndex; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "[") {
+      depth += 1;
+      continue;
+    }
+    if (char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(startIndex, index + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function extractLastJsonArray(text) {
+  const fullText = String(text || "");
+  for (let startIndex = fullText.lastIndexOf("["); startIndex !== -1; startIndex = fullText.lastIndexOf("[", startIndex - 1)) {
+    const candidate = findBalancedJsonArray(fullText, startIndex);
+    if (!candidate) continue;
+    const normalized = normalizeArticlePlanJson(candidate);
+    try {
+      const parsed = JSON.parse(normalized);
+      if (Array.isArray(parsed) && parsed.length > 0) return normalized;
+    } catch {}
+  }
+  return null;
+}
+
+async function readLargePageText(page, maxChars = 120000) {
+  return page.evaluate((limit) => {
+    const root =
+      document.querySelector("main") ||
+      document.querySelector("[role='main']") ||
+      document.querySelector("article") ||
+      document.body;
+    const text = (root?.innerText || "").trim().replace(/\n{3,}/g, "\n\n");
+    if (!text) return "";
+    return text.slice(-limit);
+  }, maxChars).catch(() => "");
+}
+
+function isRelevantBackendResponse(response) {
+  try {
+    const request = response.request();
+    const url = response.url();
+    return request.method() === "POST" && url.includes("/backend-api/") && !url.includes("/estuary/");
+  } catch {
+    return false;
+  }
+}
+
+function createBackendTrafficCapture(page) {
+  const events = [];
+  const pending = new Set();
+  const context = page.context();
+
+  const listener = (response) => {
+    if (!isRelevantBackendResponse(response)) return;
+    const task = (async () => {
+      try {
+        const request = response.request();
+        const headers = await request.allHeaders().catch(() => ({}));
+        const responseText = await response.text().catch(() => "");
+        events.push({
+          url: response.url(),
+          method: request.method(),
+          status: response.status(),
+          requestHeaders: headers,
+          requestBody: request.postData() || null,
+          responseText,
+          capturedAt: new Date().toISOString(),
+        });
+      } catch {}
+    })();
+    pending.add(task);
+    task.finally(() => pending.delete(task));
+  };
+
+  return {
+    start() {
+      context.on("response", listener);
+    },
+    async stop() {
+      context.off("response", listener);
+      await page.waitForTimeout(1200).catch(() => {});
+      await Promise.allSettled([...pending]);
+      return events;
+    },
+  };
+}
+
+function parseJsonPayloadsFromResponseText(rawText) {
+  const text = String(rawText || "").trim();
+  const payloads = [];
+  if (!text) return payloads;
+
+  const tryPush = (candidate) => {
+    if (!candidate) return;
+    try {
+      payloads.push(JSON.parse(candidate));
+    } catch {}
+  };
+
+  tryPush(text);
+
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const candidate = trimmed.slice(5).trim();
+    if (!candidate || candidate === "[DONE]") continue;
+    tryPush(candidate);
+  }
+
+  return payloads;
+}
+
+function collectAssistantTextCandidates(node, out) {
+  if (!node) return;
+  if (typeof node === "string") return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectAssistantTextCandidates(item, out);
+    return;
+  }
+  if (typeof node !== "object") return;
+
+  const role =
+    node.author?.role ||
+    node.message?.author?.role ||
+    node.role ||
+    null;
+  const content =
+    node.content ||
+    node.message?.content ||
+    null;
+
+  if (role === "assistant" && content) {
+    if (Array.isArray(content.parts)) {
+      for (const part of content.parts) {
+        if (typeof part === "string" && part.trim()) out.push(part.trim());
+      }
+    }
+    if (typeof content.text === "string" && content.text.trim()) out.push(content.text.trim());
+    if (typeof node.text === "string" && node.text.trim()) out.push(node.text.trim());
+  }
+
+  for (const value of Object.values(node)) {
+    collectAssistantTextCandidates(value, out);
+  }
+}
+
+function extractAssistantTextFromBackendEvents(events) {
+  const texts = [];
+  for (const event of events) {
+    const payloads = parseJsonPayloadsFromResponseText(event.responseText);
+    for (const payload of payloads) {
+      collectAssistantTextCandidates(payload, texts);
+    }
+  }
+  const unique = [];
+  const seen = new Set();
+  for (const text of texts) {
+    const normalized = text.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    unique.push(normalized);
+  }
+  return unique.join("\n\n").trim();
+}
+
+function buildArticlePlanPrompt({ articleTitle, articleText, maxImages, beginMarker, endMarker }) {
+  const titleBlock = articleTitle ? `Article title: ${articleTitle}\n\n` : "";
+  return [
+    "You are planning visual support for a long-form article.",
+    `Decide how many images are actually useful for the article. Usually 2-${maxImages}, never more than ${maxImages}.`,
+    "Return only valid JSON between the markers below. Do not add commentary outside the markers.",
+    "Each JSON item must be an object with these fields:",
+    '- "image": output filename such as "cover.png" or "section-2.png"',
+    '- "placement": short label such as "cover", "section-1", "section-2", "ending"',
+    '- "reason": short Chinese explanation of why this image is useful there',
+    '- "prompt": detailed English image-generation prompt, ready to use directly',
+    '- "n": integer, usually 1',
+    "Rules:",
+    "- Avoid redundant near-duplicate images.",
+    "- Prefer portrait-friendly editorial compositions for article inserts unless the content strongly needs another layout.",
+    "- Do not add text inside the image unless the article absolutely requires it.",
+    "- Prompts should be visually specific and production-ready.",
+    "",
+    beginMarker,
+    "[",
+    '  {"image":"cover.png","placement":"cover","reason":"示例","prompt":"example prompt","n":1}',
+    "]",
+    endMarker,
+    "",
+    titleBlock + "Article body:",
+    articleText,
+  ].join("\n");
+}
+
+async function planArticleImagesInCurrentChat(page, args, articleText) {
+  const articleTitle = args.articleTitle || detectArticleTitle(articleText);
+  const markerId = `BAOYU_IMAGE_PLAN_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const beginMarker = `BEGIN_${markerId}`;
+  const endMarker = `END_${markerId}`;
+  const planningPrompt = buildArticlePlanPrompt({
+    articleTitle,
+    articleText,
+    maxImages: args.articleMaxImages,
+    beginMarker,
+    endMarker,
+  });
+
+  const ready = await waitForPromptReady(page, Math.min(args.timeoutMs, 60000));
+  if (!ready) {
+    const authGate = await detectAuthGate(page);
+    if (authGate) throw new Error("ChatGPT login is still required for article planning. Complete login first.");
+    throw new Error("Timed out waiting for ChatGPT to accept the article planning prompt.");
+  }
+
+  const capture = createBackendTrafficCapture(page);
+  capture.start();
+  let events = [];
+  let planningDone = false;
+  try {
+    await setPrompt(page, planningPrompt);
+    await submitPrompt(page);
+    planningDone = await waitForPromptReady(page, Math.min(args.timeoutMs, 120000));
+  } finally {
+    events = await capture.stop();
+    await saveConversationCapture(events).catch(() => {});
+  }
+  if (!planningDone) {
+    const authGate = await detectAuthGate(page);
+    if (authGate) throw new Error("ChatGPT login is still required for article planning. Complete login first.");
+    throw new Error("Timed out waiting for ChatGPT to return the article image plan.");
+  }
+
+  const capturedAssistantText = extractAssistantTextFromBackendEvents(events);
+  const pageText = await readLargePageText(page);
+  const rawCaptureText = events.map((event) => event.responseText || "").filter(Boolean).join("\n\n");
+  const extractionSource = [capturedAssistantText, pageText, rawCaptureText].filter(Boolean).join("\n\n");
+  const extractedJson =
+    extractMarkedJson(extractionSource, beginMarker, endMarker) ||
+    extractLastFencedJson(extractionSource) ||
+    extractLastJsonArray(extractionSource);
+  if (!extractedJson) {
+    throw new Error(`ChatGPT did not return a parseable article image plan. Page text tail: ${extractionSource.slice(-2000)}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(extractedJson);
+  } catch (error) {
+    const details = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to parse article image plan JSON: ${details}`);
+  }
+
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("Article image plan JSON was empty.");
+  }
+
+  const jobs = parsed.slice(0, args.articleMaxImages).map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Article plan item ${index + 1} is not a valid object.`);
+    }
+    const prompt = typeof item.prompt === "string" ? item.prompt.trim() : "";
+    if (!prompt) {
+      throw new Error(`Article plan item ${index + 1} is missing a prompt.`);
+    }
+    const image = typeof item.image === "string" && item.image.trim()
+      ? item.image.trim()
+      : `section-${index + 1}.png`;
+    const placement = typeof item.placement === "string" && item.placement.trim()
+      ? item.placement.trim()
+      : `section-${index + 1}`;
+    const reason = typeof item.reason === "string" ? item.reason.trim() : "";
+    const n = Number.isInteger(item.n) && item.n > 0 ? item.n : 1;
+    return {
+      image,
+      placement,
+      reason,
+      prompt,
+      n,
+    };
+  });
+
+  return {
+    articleTitle,
+    jobs,
+    rawJson: extractedJson,
+  };
+}
+
+async function saveArticlePlan(args, plan) {
+  const planOutputPath = resolvePlanOutputPath(args);
+  await mkdir(path.dirname(planOutputPath), { recursive: true });
+  await writeFile(planOutputPath, `${JSON.stringify(plan.jobs, null, 2)}\n`, "utf8");
+  return planOutputPath;
+}
+
+function resolveArticleJobImagePath(args, job, index, total) {
+  const outputDir = resolveArticleOutputDir(args);
+  if (job.image && !path.isAbsolute(job.image)) {
+    return path.join(outputDir, job.image);
+  }
+  if (job.image && path.isAbsolute(job.image)) return job.image;
+  return resolveBatchItemImagePath(resolveArticleImageBasePath(args), index + 1, total);
 }
 
 async function readBatchJobs(args) {
@@ -855,7 +1484,12 @@ function buildSubmissionPrompt(prompt) {
 
 async function readPageTextSnippet(page) {
   return page.evaluate(() => {
-    const text = (document.body?.innerText || "").trim().replace(/\n{3,}/g, "\n\n");
+    const root =
+      document.querySelector("main") ||
+      document.querySelector("[role='main']") ||
+      document.querySelector("article") ||
+      document.body;
+    const text = (root?.innerText || "").trim().replace(/\n{3,}/g, "\n\n");
     if (!text) return "";
     return text.slice(-1500);
   }).catch(() => "");
@@ -1498,6 +2132,85 @@ async function runBatchGenerate(args) {
   }
 }
 
+async function runArticleFlow(args) {
+  const articleText = await readArticleText(args);
+  const articlePlan = buildLocalArticlePlan(args, articleText);
+  const planOutputPath = await saveArticlePlan(args, articlePlan);
+
+  if (args.planOnly) {
+    const payload = {
+      ok: true,
+      planningMode: articlePlan.planningMode,
+      articleTitle: articlePlan.articleTitle,
+      planOutputPath,
+      plan: articlePlan.jobs,
+      count: articlePlan.jobs.length,
+    };
+    if (args.json) console.log(JSON.stringify(payload, null, 2));
+    else {
+      console.log(`[chatgpt-web] Saved article image plan to ${planOutputPath}`);
+      console.log(`[chatgpt-web] Planned ${payload.count} images.`);
+    }
+    return;
+  }
+
+  const consentPath = await ensureConsent(args);
+  const runtime = await prepareRuntimePage(args, args.timeoutMs);
+  const { session, page, fallbackUsed, runtimeMode, authGate } = runtime;
+  try {
+    if (!runtime.ready) {
+      if (authGate) throw new Error("ChatGPT login is still required. Run --login first.");
+      throw new Error("ChatGPT session is not ready. Run --login first.");
+    }
+
+    const results = [];
+    for (let index = 0; index < articlePlan.jobs.length; index += 1) {
+      const job = articlePlan.jobs[index];
+      const imagePath = resolveArticleJobImagePath(args, job, index, articlePlan.jobs.length);
+      if (!args.json) {
+        console.log(`[chatgpt-web] Article image ${index + 1}/${articlePlan.jobs.length}: ${job.placement}`);
+      }
+      const captures = await generateImagesInCurrentChat(page, job.prompt, imagePath, job.n, args.timeoutMs);
+      const files = captures.map((item) => item.path);
+      results.push({
+        index: index + 1,
+        placement: job.placement,
+        reason: job.reason,
+        prompt: job.prompt,
+        files,
+        captures,
+        count: files.length,
+      });
+    }
+
+    const files = results.flatMap((item) => item.files);
+    const storageStatePath = await saveStorageState(session, args);
+    const payload = {
+      ok: true,
+      consentPath,
+      planningMode: articlePlan.planningMode,
+      fallbackUsed,
+      runtimeMode,
+      articleTitle: articlePlan.articleTitle,
+      profileDir: resolveProfileDir(args),
+      storageStatePath,
+      planOutputPath,
+      plan: articlePlan.jobs,
+      files,
+      results,
+      count: files.length,
+    };
+    if (args.json) console.log(JSON.stringify(payload, null, 2));
+    else {
+      console.log(`[chatgpt-web] Saved ${payload.count} article images.`);
+      console.log(`[chatgpt-web] Plan file: ${planOutputPath}`);
+      for (const filePath of files) console.log(`- ${filePath}`);
+    }
+  } finally {
+    if (!args.keepOpen) await session.close();
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -1514,6 +2227,13 @@ async function main() {
   }
   if (args.check) {
     await runCheck(args);
+    return;
+  }
+  if (hasArticleInputs(args)) {
+    await runArticleFlow({
+      ...args,
+      imagePath: args.imagePath || resolveArticleImageBasePath(args),
+    });
     return;
   }
   if (args.batchFile) {

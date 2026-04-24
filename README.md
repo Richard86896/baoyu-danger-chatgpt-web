@@ -50,6 +50,22 @@ This opens visible Chrome. Complete ChatGPT login and any Cloudflare checks in t
 node scripts/main.js --prompt "A cinematic bookstore interior, warm tungsten light" --image out.png
 ```
 
+## Article Example
+
+When you have a full article and want the skill to decide how many images are needed based on the article body:
+
+```bash
+node scripts/main.js --article-file article.md --image article.png
+```
+
+If you only want the plan JSON first:
+
+```bash
+node scripts/main.js --article-file article.md --plan-only --plan-output article-images.json
+```
+
+In article mode, the plan is derived locally from the article structure first, then ChatGPT is only used for the actual image generation step.
+
 ## Batch Example
 
 When one request needs multiple different images, use one batch file instead of opening a fresh ChatGPT conversation for every image.

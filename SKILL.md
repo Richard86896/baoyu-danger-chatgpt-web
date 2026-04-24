@@ -100,6 +100,12 @@ node scripts/main.js --login --accept-risk
 # Verify saved session in a background browser
 node scripts/main.js --check
 
+# Let the skill infer image count and prompts directly from an article file
+node scripts/main.js --article-file article.md --image article.png
+
+# Only build the article image plan JSON
+node scripts/main.js --article-file article.md --plan-only --plan-output article-images.json
+
 # Generate one image in a background browser
 node scripts/main.js --prompt "A cinematic bookstore interior, warm tungsten light" --image out.png
 
@@ -131,6 +137,13 @@ node scripts/main.js --attach --prompt "A clean SaaS hero illustration" --image 
 | `--show-disclaimer` | Print the disclaimer and exit |
 | `--prompt`, `-p` | Prompt text |
 | `--promptfiles <files...>` | Concatenate prompt files |
+| `--article <text>` | Article text to analyze for image planning |
+| `--article-file <path>` | Read article text from one file |
+| `--articlefiles <files...>` | Read article text from multiple files and concatenate them |
+| `--article-title <text>` | Optional title override for article mode |
+| `--article-max-images <n>` | Maximum number of images to plan in article mode |
+| `--plan-only` | In article mode, only output/save the plan JSON without generating images |
+| `--plan-output <path>` | Where to save the generated article image plan JSON |
 | `--batch-file <path>` | Submit multiple prompt jobs sequentially inside one ChatGPT conversation |
 | `--image [path]` | Output image path, default `generated.png` |
 | `--n <count>` | Number of images to capture from the page, default `1` |
@@ -150,6 +163,8 @@ node scripts/main.js --attach --prompt "A clean SaaS hero illustration" --image 
 - Default login opens a managed visible Chrome, saves state, and closes it automatically
 - Default generation first tries saved session state in a background browser
 - If background mode is not usable on this machine, the script automatically falls back to a visible managed Chrome run
+- In article mode, the skill first builds the image plan locally from the article structure, then uses ChatGPT only for the actual image generation
+- Prefer article mode when the user gives a full article and wants the skill to decide how many images are needed and where they belong
 - Use `--attach` only when you explicitly want the old manual debug-port workflow
 - When the user asks for multiple different images in one request, prefer one `--batch-file` run so all prompts stay in the same ChatGPT thread
 - Do not open a fresh ChatGPT conversation for every image unless a specific batch item failed and you are retrying it
@@ -186,6 +201,38 @@ Notes:
 - Object fields: `prompt`, optional `image` or `imagePath`, optional `n`, optional `promptFiles`
 - If an item has no `image`, the script derives filenames from the CLI `--image` base path, such as `article-1.png`, `article-2.png`
 - If you want a clean thread, open one new ChatGPT chat manually before running the batch command; the script will then keep using that same thread
+
+## Article Mode
+
+Use article mode when the user provides article正文 and wants the skill to infer how many images are needed, where they should go, and what each image should depict.
+
+```bash
+node scripts/main.js --article-file article.md --image article.png
+```
+
+What article mode does:
+- Reads the article text
+- Builds a JSON image plan locally from the article body
+- Saves that plan as a local JSON file
+- Uses the planned prompts to generate the actual images
+
+Example plan output:
+
+```json
+[
+  {
+    "image": "cover.png",
+    "placement": "cover",
+    "reason": "封面需要建立主题氛围",
+    "prompt": "A cinematic editorial illustration about ...",
+    "n": 1
+  }
+]
+```
+
+Agent routing note:
+- When the user pastes article正文 directly in chat, save it to a temporary local file first, then call `--article-file`
+- If the user only wants the plan for review, use `--plan-only`
 
 ## Environment Variables
 
